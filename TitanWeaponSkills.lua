@@ -2,7 +2,7 @@
 
 local ADDON_NAME = "TitanWeaponSkills"
 local GetAddOnMetadata = C_AddOns and C_AddOns.GetAddOnMetadata or GetAddOnMetadata
-local VERSION = GetAddOnMetadata(ADDON_NAME, "Version") or "1.1.0"
+local VERSION = GetAddOnMetadata(ADDON_NAME, "Version") or "1.1.1"
 
 local Elib = LibStub and LibStub("Elib-4.0", true)
 if not Elib then
@@ -16,6 +16,7 @@ local locale = GetLocale()
 if locale == "deDE" then
     L["NO_WEAPON"] = "Keine"
     L["NOT_LEARNED"] = "Nicht gelernt, erlernbar"
+    L["LEARNED"] = "Gelernt"
     L["NO_WEAPON_SKILL"] = "Keine Waffenfertigkeit vorhanden"
     L["SKILL"] = "Fertigkeit"
     L["MAXIMUM"] = "Maximum"
@@ -24,9 +25,12 @@ if locale == "deDE" then
     L["SHOW_MAX"] = "Maximum anzeigen"
     L["SHOW_SESSION"] = "Session-Fortschritt anzeigen"
     L["SHOW_UNLEARNED"] = "Ungelernte Fertigkeiten anzeigen"
+    L["MARK_LEARNED"] = "Als gelernt markieren"
+    L["USES_UNARMED"] = "Trefferchance und Fortschritt über Unbewaffnet"
 else
     L["NO_WEAPON"] = "None"
     L["NOT_LEARNED"] = "Not learned, trainable"
+    L["LEARNED"] = "Learned"
     L["NO_WEAPON_SKILL"] = "No weapon skill available"
     L["SKILL"] = "Skill"
     L["MAXIMUM"] = "Maximum"
@@ -35,6 +39,8 @@ else
     L["SHOW_MAX"] = "Show Maximum"
     L["SHOW_SESSION"] = "Show Session Progress"
     L["SHOW_UNLEARNED"] = "Show Unlearned Skills"
+    L["MARK_LEARNED"] = "Mark as learned"
+    L["USES_UNARMED"] = "Hit chance and progress use Unarmed"
 end
 
 local Color = {}
@@ -63,6 +69,8 @@ end
     Stable weapon definitions.
     names: exact localized skill line names (must be exact to avoid Axes vs Two-Handed Axes).
     classes: English class tokens that can learn this skill.
+    spellIds: optional proficiency / passive spell IDs (spellbook / IsPlayerSpell fallback).
+    binary: no progressive skill ranks (e.g. Dual Wield).
 ]]
 local WEAPON_DEFS = {
     {
@@ -72,7 +80,8 @@ local WEAPON_DEFS = {
             enUS = "Axes", deDE = "Äxte", frFR = "Haches", esES = "Hachas", esMX = "Hachas",
             ruRU = "Топоры", zhCN = "斧", zhTW = "斧", koKR = "도끼",
         },
-        classes = { WARRIOR = true, PALADIN = true, HUNTER = true, ROGUE = true, SHAMAN = true },
+        -- Rogues cannot train Axes until WotLK; not available in Classic Era / TBC.
+        classes = { WARRIOR = true, PALADIN = true, HUNTER = true, SHAMAN = true },
     },
     {
         id = "TWO_HANDED_AXES",
@@ -130,7 +139,8 @@ local WEAPON_DEFS = {
             esES = "Armas de asta", esMX = "Armas de asta",
             ruRU = "Древковое оружие", zhCN = "长柄武器", zhTW = "長柄武器", koKR = "장창류",
         },
-        classes = { WARRIOR = true, PALADIN = true, HUNTER = true, DRUID = true },
+        -- Druids cannot use Polearms in Classic Era or TBC (briefly added then reverted on Era).
+        classes = { WARRIOR = true, PALADIN = true, HUNTER = true },
     },
     {
         id = "STAVES",
@@ -158,7 +168,11 @@ local WEAPON_DEFS = {
             esES = "Armas de puño", esMX = "Armas de puño",
             ruRU = "Кистевое оружие", zhCN = "拳套", zhTW = "拳套", koKR = "장착 무기류",
         },
-        classes = { WARRIOR = true, HUNTER = true, ROGUE = true, SHAMAN = true, DRUID = true },
+        -- Hunters cannot use Fist Weapons in Classic Era or TBC.
+        classes = { WARRIOR = true, ROGUE = true, SHAMAN = true, DRUID = true },
+        -- Proficiency only; combat skill ranks are tracked via Unarmed.
+        spellIds = { 15590 },
+        rankFromId = "UNARMED",
     },
     {
         id = "UNARMED",
@@ -237,16 +251,20 @@ local WEAPON_DEFS = {
             esES = "Doble empuñadura", esMX = "Doble empuñadura",
             ruRU = "Бой двумя оружиями", zhCN = "双武器", zhTW = "雙武器", koKR = "쌍수 무기",
         },
-        -- Hunter dual wield is TBC+; Classic Era hunters cannot learn it.
+        -- Dual Wield: Warrior/Hunter/Rogue in both; Shaman only via TBC Enhancement talent.
         classes = isTBC
-            and { WARRIOR = true, HUNTER = true, ROGUE = true }
-            or { WARRIOR = true, ROGUE = true },
+            and { WARRIOR = true, HUNTER = true, ROGUE = true, SHAMAN = true }
+            or { WARRIOR = true, HUNTER = true, ROGUE = true },
+        spellIds = { 674 },
+        binary = true,
+        checkCanDualWield = true,
     },
 }
 
 local sessionGains = {}
 local skillCache = {}
 local cacheDirty = true
+local refreshingCache = false
 
 local function GetDisplayName(weaponDef)
     return weaponDef.names[locale] or weaponDef.names.enUS or weaponDef.id
@@ -260,47 +278,100 @@ local function BuildNameLookup(weaponDef)
     return lookup
 end
 
+local weaponDefsById = {}
 for _, def in ipairs(WEAPON_DEFS) do
     def.nameLookup = BuildNameLookup(def)
     def.displayName = GetDisplayName(def)
+    weaponDefsById[def.id] = def
+end
+
+local function IsSpellProficiencyKnown(spellIds)
+    if not spellIds then
+        return false
+    end
+
+    for _, spellId in ipairs(spellIds) do
+        if IsPlayerSpell and IsPlayerSpell(spellId) then
+            return true
+        end
+        if IsSpellKnown and IsSpellKnown(spellId) then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function IsWeaponProficiencyKnown(weaponDef)
+    if weaponDef.checkCanDualWield and CanDualWield and CanDualWield() then
+        return true
+    end
+    return IsSpellProficiencyKnown(weaponDef.spellIds)
+end
+
+local function IsSkillFrameOpen()
+    return SkillFrame and SkillFrame:IsShown()
 end
 
 local function RefreshSkillCache()
-    wipe(skillCache)
-
-    -- Expand collapsed headers backwards so inserted rows do not shift unread indices.
-    local collapsedHeaders = {}
-    for i = GetNumSkillLines() or 0, 1, -1 do
-        local skillName, isHeader, isExpanded = GetSkillLineInfo(i)
-        if isHeader and not isExpanded and skillName then
-            collapsedHeaders[skillName] = true
-            ExpandSkillHeader(i)
-        end
+    if refreshingCache then
+        return
     end
+    refreshingCache = true
 
-    for i = 1, GetNumSkillLines() or 0 do
-        local skillName, isHeader, _, skillRank, _, _, skillMaxRank = GetSkillLineInfo(i)
-        if skillName and not isHeader and skillRank and skillRank > 0 then
-            skillCache[skillName] = {
-                rank = skillRank,
-                maxRank = skillMaxRank or 0,
-            }
+    local ok = pcall(function()
+        local newCache = {}
+        local collapsedHeaders = {}
+        -- Expanding/collapsing while the skill UI is open re-enters SkillFrame and can stack-overflow.
+        local canToggleHeaders = not IsSkillFrameOpen()
+
+        if canToggleHeaders then
+            -- Expand collapsed headers backwards so inserted rows do not shift unread indices.
+            for i = GetNumSkillLines() or 0, 1, -1 do
+                local skillName, isHeader, isExpanded = GetSkillLineInfo(i)
+                if isHeader and not isExpanded and skillName then
+                    collapsedHeaders[skillName] = true
+                    ExpandSkillHeader(i)
+                end
+            end
         end
-    end
 
-    -- Restore previously collapsed headers (backwards again).
-    for i = GetNumSkillLines() or 0, 1, -1 do
-        local skillName, isHeader = GetSkillLineInfo(i)
-        if isHeader and skillName and collapsedHeaders[skillName] then
-            CollapseSkillHeader(i)
+        for i = 1, GetNumSkillLines() or 0 do
+            local skillName, isHeader, _, skillRank, _, _, skillMaxRank = GetSkillLineInfo(i)
+            if skillName and not isHeader and skillRank and skillRank > 0 then
+                newCache[skillName] = {
+                    rank = skillRank,
+                    maxRank = skillMaxRank or 0,
+                }
+            end
         end
-    end
 
-    cacheDirty = false
+        if canToggleHeaders then
+            -- Restore previously collapsed headers (backwards again).
+            for i = GetNumSkillLines() or 0, 1, -1 do
+                local skillName, isHeader = GetSkillLineInfo(i)
+                if isHeader and skillName and collapsedHeaders[skillName] then
+                    CollapseSkillHeader(i)
+                end
+            end
+        end
+
+        wipe(skillCache)
+        for name, data in pairs(newCache) do
+            skillCache[name] = data
+        end
+
+        cacheDirty = false
+    end)
+
+    refreshingCache = false
+    if not ok then
+        cacheDirty = true
+    end
 end
 
 local function GetCachedSkill(weaponDef)
-    if cacheDirty then
+    if cacheDirty and not refreshingCache then
         RefreshSkillCache()
     end
 
@@ -334,6 +405,7 @@ local menus = {
     { type = "toggle", text = L["SHOW_MAX"], var = "ShowMax", def = true },
     { type = "toggle", text = L["SHOW_SESSION"], var = "ShowSession", def = true },
     { type = "toggle", text = L["SHOW_UNLEARNED"], var = "ShowUnlearned", def = true },
+    { type = "toggle", text = L["MARK_LEARNED"], var = "MarkLearned", def = false },
     { type = "rightSideToggle" },
 }
 
@@ -342,20 +414,66 @@ local function CreateWeaponPlugin(weaponDef)
     local displayName = weaponDef.displayName
 
     local function UpdateVars(registry)
-        local skillName, rank, maxRank = GetCachedSkill(weaponDef)
+        local proficiencyKnown = IsWeaponProficiencyKnown(weaponDef)
+        local markedLearned = TitanGetVar and TitanGetVar(titanId, "MarkLearned")
 
-        if skillName then
+        -- Fist Weapons etc.: proficiency is binary, ranks come from another skill (Unarmed).
+        if weaponDef.rankFromId then
+            local rankSource = weaponDefsById[weaponDef.rankFromId]
+            local rank, maxRank
+            if rankSource then
+                _, rank, maxRank = GetCachedSkill(rankSource)
+            end
+            local learned = proficiencyKnown or markedLearned
+            local hasRanks = learned and rank and maxRank and maxRank > 0
+
+            if learned then
+                if registry then
+                    registry.icon = weaponDef.icon
+                    registry.tooltipTitle = displayName
+                    registry.menuText = Color.GREEN .. displayName .. "|r"
+                end
+
+                if hasRanks then
+                    if not sessionGains[displayName] then
+                        sessionGains[displayName] = rank
+                    end
+                    return displayName, weaponDef.icon, rank, maxRank, true, true
+                end
+
+                return displayName, weaponDef.icon, 0, 0, true, false
+            end
+
             if registry then
                 registry.icon = weaponDef.icon
-                registry.tooltipTitle = skillName
-                registry.menuText = Color.GREEN .. skillName .. "|r"
+                registry.tooltipTitle = displayName
+                registry.menuText = displayName .. " [" .. Color.YELLOW .. L["NOT_LEARNED"] .. "|r]"
             end
 
-            if not sessionGains[skillName] then
-                sessionGains[skillName] = rank
+            return displayName, weaponDef.icon, 0, 0, false, false
+        end
+
+        local skillName, rank, maxRank = GetCachedSkill(weaponDef)
+        local learned = skillName ~= nil or proficiencyKnown or markedLearned
+        local hasRanks = skillName ~= nil and rank and maxRank and maxRank > 0 and not weaponDef.binary
+
+        if learned then
+            local title = skillName or displayName
+            if registry then
+                registry.icon = weaponDef.icon
+                registry.tooltipTitle = title
+                registry.menuText = Color.GREEN .. title .. "|r"
             end
 
-            return skillName, weaponDef.icon, rank, maxRank, true
+            if skillName then
+                if not sessionGains[skillName] then
+                    sessionGains[skillName] = rank
+                end
+                return skillName, weaponDef.icon, rank, maxRank, true, hasRanks
+            end
+
+            -- Binary skills / spell-only / manual mark: no progressive ranks.
+            return displayName, weaponDef.icon, 0, 0, true, false
         end
 
         if registry then
@@ -364,20 +482,24 @@ local function CreateWeaponPlugin(weaponDef)
             registry.menuText = displayName .. " [" .. Color.YELLOW .. L["NOT_LEARNED"] .. "|r]"
         end
 
-        return displayName, weaponDef.icon, 0, 0, false
+        return displayName, weaponDef.icon, 0, 0, false, false
     end
 
     local function ReloadPlugin()
+        -- Ignore SKILL_LINES_CHANGED fired by our own Expand/CollapseSkillHeader calls.
+        if refreshingCache then
+            return
+        end
         cacheDirty = true
         TitanPanelButton_UpdateButton(titanId)
     end
 
     local function CreateToolTip()
-        local name, _, level, maxLevel, learned = UpdateVars()
+        local name, _, level, maxLevel, learned, hasRanks = UpdateVars()
 
         GameTooltip:SetText(name or displayName, HIGHLIGHT_FONT_COLOR.r, HIGHLIGHT_FONT_COLOR.g, HIGHLIGHT_FONT_COLOR.b)
 
-        if learned and maxLevel and maxLevel > 0 then
+        if learned and hasRanks then
             GameTooltip:AddLine(" ")
 
             local percent = (level / maxLevel) * 100
@@ -390,6 +512,17 @@ local function CreateWeaponPlugin(weaponDef)
             if diff > 0 then
                 GameTooltip:AddDoubleLine(L["THIS_SESSION"], Color.GREEN .. "+" .. diff)
             end
+
+            if weaponDef.rankFromId then
+                GameTooltip:AddLine(" ")
+                GameTooltip:AddLine(L["USES_UNARMED"], 0.7, 0.7, 0.7, true)
+            end
+        elseif learned then
+            GameTooltip:AddLine(" ")
+            GameTooltip:AddLine(L["LEARNED"], 0.24, 0.86, 0.33, true)
+            if weaponDef.rankFromId then
+                GameTooltip:AddLine(L["USES_UNARMED"], 0.7, 0.7, 0.7, true)
+            end
         else
             GameTooltip:AddLine(" ")
             GameTooltip:AddLine(L["NOT_LEARNED"], 1, 1, 0.3, true)
@@ -397,13 +530,17 @@ local function CreateWeaponPlugin(weaponDef)
     end
 
     local function GetButtonText(self, id)
-        local name, _, level, maxLevel, learned = UpdateVars(self.registry)
+        local name, _, level, maxLevel, learned, hasRanks = UpdateVars(self.registry)
 
         if not learned then
             if not TitanGetVar(id, "ShowUnlearned") then
                 return
             end
             return displayName .. ": ", Color.YELLOW .. L["NOT_LEARNED"]
+        end
+
+        if not hasRanks then
+            return displayName .. ": ", Color.GREEN .. L["LEARNED"]
         end
 
         local showMax = TitanGetVar(id, "ShowMax")
@@ -439,6 +576,7 @@ local function CreateWeaponPlugin(weaponDef)
             PLAYER_ENTERING_WORLD = ReloadPlugin,
             CHAT_MSG_SKILL = ReloadPlugin,
             PLAYER_LEVEL_UP = ReloadPlugin,
+            SPELLS_CHANGED = ReloadPlugin,
         },
         customTooltip = CreateToolTip,
         menus = menus,
