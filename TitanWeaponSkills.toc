@@ -1,6 +1,6 @@
 ## Interface: 20505, 20506, 11508
-## Title: Titan Panel [|cffeda55fWeapon skills|r] |cff00aa001.1.0|r
-## Version: 1.1.0
+## Title: Titan Panel [|cffeda55fWeapon skills|r] |cff00aa001.1.1|r
+## Version: 1.1.1
 ## IconTexture: Interface\Icons\INV_Axe_01
 ## Notes: Displays your weapon skills on Titan Panel (learned and learnable).
 ## Author: NeRgY
