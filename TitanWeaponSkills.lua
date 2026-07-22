@@ -1,46 +1,16 @@
 ---@diagnostic disable: duplicate-set-field
 
-local ADDON_NAME = "TitanWeaponSkills"
+local ADDON_NAME, ns = ...
+local L = ns.L
+local locale = GetLocale()
+
 local GetAddOnMetadata = C_AddOns and C_AddOns.GetAddOnMetadata or GetAddOnMetadata
-local VERSION = GetAddOnMetadata(ADDON_NAME, "Version") or "1.1.1"
+local VERSION = GetAddOnMetadata(ADDON_NAME, "Version") or "1.1.2"
 
 local Elib = LibStub and LibStub("Elib-4.0", true)
 if not Elib then
     DEFAULT_CHAT_FRAME:AddMessage("|cffff0000TitanWeaponSkills:|r Elib-4.0 library not found!")
     return
-end
-
-local L = {}
-local locale = GetLocale()
-
-if locale == "deDE" then
-    L["NO_WEAPON"] = "Keine"
-    L["NOT_LEARNED"] = "Nicht gelernt, erlernbar"
-    L["LEARNED"] = "Gelernt"
-    L["NO_WEAPON_SKILL"] = "Keine Waffenfertigkeit vorhanden"
-    L["SKILL"] = "Fertigkeit"
-    L["MAXIMUM"] = "Maximum"
-    L["PROGRESS"] = "Fortschritt"
-    L["THIS_SESSION"] = "Diese Sitzung"
-    L["SHOW_MAX"] = "Maximum anzeigen"
-    L["SHOW_SESSION"] = "Session-Fortschritt anzeigen"
-    L["SHOW_UNLEARNED"] = "Ungelernte Fertigkeiten anzeigen"
-    L["MARK_LEARNED"] = "Als gelernt markieren"
-    L["USES_UNARMED"] = "Trefferchance und Fortschritt über Unbewaffnet"
-else
-    L["NO_WEAPON"] = "None"
-    L["NOT_LEARNED"] = "Not learned, trainable"
-    L["LEARNED"] = "Learned"
-    L["NO_WEAPON_SKILL"] = "No weapon skill available"
-    L["SKILL"] = "Skill"
-    L["MAXIMUM"] = "Maximum"
-    L["PROGRESS"] = "Progress"
-    L["THIS_SESSION"] = "This Session"
-    L["SHOW_MAX"] = "Show Maximum"
-    L["SHOW_SESSION"] = "Show Session Progress"
-    L["SHOW_UNLEARNED"] = "Show Unlearned Skills"
-    L["MARK_LEARNED"] = "Mark as learned"
-    L["USES_UNARMED"] = "Hit chance and progress use Unarmed"
 end
 
 local Color = {}

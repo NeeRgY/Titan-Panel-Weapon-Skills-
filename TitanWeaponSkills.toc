@@ -1,10 +1,22 @@
-## Interface: 20505, 20506, 11508
-## Title: Titan Panel [|cffeda55fWeapon skills|r] |cff00aa001.1.1|r
-## Version: 1.1.1
+## Interface: 20505, 20506, 11508, 11509
+## Title: Titan Panel [|cffeda55fWeapon skills|r] |cff00aa001.1.2|r
+## Version: 1.1.2
 ## IconTexture: Interface\Icons\INV_Axe_01
 ## Notes: Displays your weapon skills on Titan Panel (learned and learnable).
+## Notes-deDE: Zeigt deine Waffenfertigkeiten auf der Titan Panel an (gelernt und erlernbar).
+## Notes-frFR: Affiche vos compétences d'armes sur Titan Panel (apprises et apprenables).
+## Notes-esES: Muestra tus habilidades de armas en Titan Panel (aprendidas y aprendibles).
+## Notes-esMX: Muestra tus habilidades de armas en Titan Panel (aprendidas y aprendibles).
+## Notes-ruRU: Отображает ваши навыки оружия на Titan Panel (изученные и доступные).
 ## Author: NeRgY
 ## Dependencies: Titan
 
 Libs\Elib-4.0\Elib-4.0.lua
+
+Locales\enUS.lua
+Locales\deDE.lua
+Locales\frFR.lua
+Locales\esES.lua
+Locales\ruRU.lua
+
 TitanWeaponSkills.lua
