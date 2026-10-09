@@ -5,7 +5,7 @@ local L = ns.L
 local locale = GetLocale()
 
 local GetAddOnMetadata = C_AddOns and C_AddOns.GetAddOnMetadata or GetAddOnMetadata
-local VERSION = GetAddOnMetadata(ADDON_NAME, "Version") or "1.1.2"
+local VERSION = GetAddOnMetadata(ADDON_NAME, "Version") or "1.1.4"
 
 local Elib = LibStub and LibStub("Elib-4.0", true)
 if not Elib then
@@ -21,7 +21,8 @@ Color.GREEN = "|cFF3DDC53"
 Color.ORANGE = "|cFFFFA500"
 Color.GRAY = "|cFF888888"
 
--- Project detection (Classic Era vs TBC Classic)
+-- Project detection (Classic Era vs TBC Classic vs WoW Forever)
+-- WoW Forever reports interface 16xxx (beta: 16001); treated like TBC+ (Shaman Dual Wield).
 local isTBC = false
 do
     local projectId = WOW_PROJECT_ID
@@ -29,7 +30,7 @@ do
         isTBC = true
     else
         local build = select(4, GetBuildInfo())
-        if build and build >= 20000 and build < 30000 then
+        if build and ((build >= 20000 and build < 30000) or (build >= 16000 and build < 17000)) then
             isTBC = true
         end
     end
@@ -160,7 +161,7 @@ local WEAPON_DEFS = {
         id = "BOWS",
         icon = "Interface\\Icons\\INV_Weapon_Bow_04",
         names = {
-            enUS = "Bows", deDE = "Bögen", frFR = "Arcs", esES = "Arcos", esMX = "Arcos",
+            enUS = "Bows", deDE = "Bogen", deDE_alt = "Bögen", frFR = "Arcs", esES = "Arcos", esMX = "Arcos",
             ruRU = "Луки", zhCN = "弓", zhTW = "弓", koKR = "활",
         },
         classes = { WARRIOR = true, HUNTER = true, ROGUE = true },
@@ -235,6 +236,7 @@ local sessionGains = {}
 local skillCache = {}
 local cacheDirty = true
 local refreshingCache = false
+local tooltipDebug = false -- toggled by /tws tooltip
 
 local function GetDisplayName(weaponDef)
     return weaponDef.names[locale] or weaponDef.names.enUS or weaponDef.id
@@ -248,8 +250,17 @@ local function BuildNameLookup(weaponDef)
     return lookup
 end
 
+-- Classic skill line IDs, used for direct lookup where the skill list cannot be expanded (WoW Forever).
+local SKILL_IDS = {
+    SWORDS = 43, AXES = 44, BOWS = 45, GUNS = 46, MACES = 54, TWO_HANDED_SWORDS = 55,
+    DEFENSE = 95, DUAL_WIELD = 118, STAVES = 136, TWO_HANDED_MACES = 160, UNARMED = 162,
+    TWO_HANDED_AXES = 172, DAGGERS = 173, THROWN = 176, CROSSBOWS = 226, WANDS = 228,
+    POLEARMS = 229, FIST_WEAPONS = 473,
+}
+
 local weaponDefsById = {}
 for _, def in ipairs(WEAPON_DEFS) do
+    def.skillId = SKILL_IDS[def.id]
     def.nameLookup = BuildNameLookup(def)
     def.displayName = GetDisplayName(def)
     weaponDefsById[def.id] = def
@@ -279,8 +290,32 @@ local function IsWeaponProficiencyKnown(weaponDef)
     return IsSpellProficiencyKnown(weaponDef.spellIds)
 end
 
+-- Forever moved the skill API into C_SkillInfo; Classic Era/TBC still use the globals.
+local API_GetNumSkillLines = GetNumSkillLines or (C_SkillInfo and C_SkillInfo.GetNumSkillLines)
+local API_ExpandSkillHeader = ExpandSkillHeader or (C_SkillInfo and C_SkillInfo.ExpandSkillHeader)
+local API_CollapseSkillHeader = CollapseSkillHeader or (C_SkillInfo and C_SkillInfo.CollapseSkillHeader)
+local RawGetSkillLineInfo = GetSkillLineInfo or (C_SkillInfo and C_SkillInfo.GetSkillLineInfo)
+
+-- Forever has no global skill API and ignores ExpandSkillHeader, so weapon skills
+-- (children of the collapsed "Weapon Skills" header) are looked up by skill line ID instead.
+local API_GetSkillLineInfoByID = not GetNumSkillLines and C_SkillInfo and C_SkillInfo.GetSkillLineInfoByID or nil
+
+local function API_GetSkillLineInfo(index)
+    local first = RawGetSkillLineInfo(index)
+    if type(first) == "table" then
+        -- Table-style return (retail-like field names); Forever reports isCollapsed, not isExpanded.
+        local isExpanded = first.isExpanded
+        if isExpanded == nil and first.isCollapsed ~= nil then
+            isExpanded = not first.isCollapsed
+        end
+        return first.skillName or first.name, first.isHeader, isExpanded, first.skillRank or first.rank,
+            first.numTempPoints, first.skillModifier, first.skillMaxRank or first.maxRank
+    end
+    return RawGetSkillLineInfo(index)
+end
+
 local function IsSkillFrameOpen()
-    return SkillFrame and SkillFrame:IsShown()
+    return (SkillFrame and SkillFrame:IsShown()) or false
 end
 
 local function RefreshSkillCache()
@@ -291,23 +326,42 @@ local function RefreshSkillCache()
 
     local ok = pcall(function()
         local newCache = {}
+
+        if API_GetSkillLineInfoByID then
+            for _, def in ipairs(WEAPON_DEFS) do
+                local info = def.skillId and API_GetSkillLineInfoByID(def.skillId)
+                if type(info) == "table" and info.name and not info.isHeader then
+                    -- Keyed by weapon id, not name: localized names differ between clients.
+                    newCache[def.id] = { name = info.name, rank = info.rank or 0, maxRank = info.maxRank or 0 }
+                end
+            end
+
+            wipe(skillCache)
+            for name, data in pairs(newCache) do
+                skillCache[name] = data
+            end
+            -- Empty result usually means skill data was not loaded yet; retry on next access.
+            cacheDirty = next(newCache) == nil
+            return
+        end
+
         local collapsedHeaders = {}
         -- Expanding/collapsing while the skill UI is open re-enters SkillFrame and can stack-overflow.
         local canToggleHeaders = not IsSkillFrameOpen()
 
         if canToggleHeaders then
             -- Expand collapsed headers backwards so inserted rows do not shift unread indices.
-            for i = GetNumSkillLines() or 0, 1, -1 do
-                local skillName, isHeader, isExpanded = GetSkillLineInfo(i)
+            for i = API_GetNumSkillLines() or 0, 1, -1 do
+                local skillName, isHeader, isExpanded = API_GetSkillLineInfo(i)
                 if isHeader and not isExpanded and skillName then
                     collapsedHeaders[skillName] = true
-                    ExpandSkillHeader(i)
+                    API_ExpandSkillHeader(i)
                 end
             end
         end
 
-        for i = 1, GetNumSkillLines() or 0 do
-            local skillName, isHeader, _, skillRank, _, _, skillMaxRank = GetSkillLineInfo(i)
+        for i = 1, API_GetNumSkillLines() or 0 do
+            local skillName, isHeader, _, skillRank, _, _, skillMaxRank = API_GetSkillLineInfo(i)
             if skillName and not isHeader and skillRank and skillRank > 0 then
                 newCache[skillName] = {
                     rank = skillRank,
@@ -318,10 +372,10 @@ local function RefreshSkillCache()
 
         if canToggleHeaders then
             -- Restore previously collapsed headers (backwards again).
-            for i = GetNumSkillLines() or 0, 1, -1 do
-                local skillName, isHeader = GetSkillLineInfo(i)
+            for i = API_GetNumSkillLines() or 0, 1, -1 do
+                local skillName, isHeader = API_GetSkillLineInfo(i)
                 if isHeader and skillName and collapsedHeaders[skillName] then
-                    CollapseSkillHeader(i)
+                    API_CollapseSkillHeader(i)
                 end
             end
         end
@@ -343,6 +397,14 @@ end
 local function GetCachedSkill(weaponDef)
     if cacheDirty and not refreshingCache then
         RefreshSkillCache()
+    end
+
+    if API_GetSkillLineInfoByID then
+        local data = skillCache[weaponDef.id]
+        if data then
+            return data.name, data.rank, data.maxRank
+        end
+        return nil, nil, nil
     end
 
     for name in pairs(weaponDef.nameLookup) do
@@ -385,6 +447,9 @@ local function CreateWeaponPlugin(weaponDef)
 
     local function UpdateVars(registry)
         local proficiencyKnown = IsWeaponProficiencyKnown(weaponDef)
+        if not proficiencyKnown and weaponDef.rankFromId and GetCachedSkill(weaponDef) then
+            proficiencyKnown = true
+        end
         local markedLearned = TitanGetVar and TitanGetVar(titanId, "MarkLearned")
 
         -- Fist Weapons etc.: proficiency is binary, ranks come from another skill (Unarmed).
@@ -464,7 +529,38 @@ local function CreateWeaponPlugin(weaponDef)
         TitanPanelButton_UpdateButton(titanId)
     end
 
-    local function CreateToolTip()
+    local function TooltipDebug(stage, ...)
+        if not tooltipDebug then
+            return
+        end
+        local owner = GameTooltip:GetOwner()
+        local point, rel, relPoint, x, y = GameTooltip:GetPoint(1)
+        DEFAULT_CHAT_FRAME:AddMessage("|cffeda55fTWS tooltip:|r " .. weaponDef.id .. " " .. stage
+            .. " | args=" .. select("#", ...)
+            .. " | owner=" .. tostring(owner and owner.GetName and owner:GetName())
+            .. " | shown=" .. tostring(GameTooltip:IsShown())
+            .. " | lines=" .. tostring(GameTooltip:NumLines())
+            .. " | alpha=" .. tostring(GameTooltip:GetAlpha())
+            .. " | scale=" .. tostring(GameTooltip:GetScale())
+            .. " | point=" .. tostring(point) .. "/" .. tostring(rel and rel.GetName and rel:GetName())
+            .. "/" .. tostring(relPoint) .. " " .. tostring(x and math.floor(x)) .. "," .. tostring(y and math.floor(y))
+            .. " | left=" .. tostring(GameTooltip:GetLeft() and math.floor(GameTooltip:GetLeft()))
+            .. " bottom=" .. tostring(GameTooltip:GetBottom() and math.floor(GameTooltip:GetBottom()))
+            .. " | strata=" .. tostring(GameTooltip:GetFrameStrata()))
+    end
+
+    local function CreateToolTip(...)
+        TooltipDebug("called", ...)
+
+        -- Titan Classic (TBC) hands us a tooltip without owner or anchor; attach it to our panel button.
+        local button = _G["TitanPanel" .. titanId .. "Button"]
+        if button and not GameTooltip:IsShown() then
+            local _, centerY = button:GetCenter()
+            local onBottomHalf = centerY
+                and centerY * button:GetEffectiveScale() < UIParent:GetTop() * UIParent:GetEffectiveScale() / 2
+            GameTooltip:SetOwner(button, onBottomHalf and "ANCHOR_TOP" or "ANCHOR_BOTTOM")
+        end
+
         local name, _, level, maxLevel, learned, hasRanks = UpdateVars()
 
         GameTooltip:SetText(name or displayName, HIGHLIGHT_FONT_COLOR.r, HIGHLIGHT_FONT_COLOR.g, HIGHLIGHT_FONT_COLOR.b)
@@ -496,6 +592,15 @@ local function CreateWeaponPlugin(weaponDef)
         else
             GameTooltip:AddLine(" ")
             GameTooltip:AddLine(L["NOT_LEARNED"], 1, 1, 0.3, true)
+        end
+
+        GameTooltip:Show()
+
+        if tooltipDebug then
+            TooltipDebug("built")
+            if C_Timer and C_Timer.After then
+                C_Timer.After(0.2, function() TooltipDebug("after 0.2s") end)
+            end
         end
     end
 
@@ -533,7 +638,7 @@ local function CreateWeaponPlugin(weaponDef)
         return name .. ": ", GetSkillLevelColor(level, maxLevel) .. level .. maxText .. sessionText .. "|r"
     end
 
-    Elib.Register({
+    local button = Elib.Register({
         id = titanId,
         name = displayName,
         tooltip = displayName,
@@ -551,6 +656,13 @@ local function CreateWeaponPlugin(weaponDef)
         customTooltip = CreateToolTip,
         menus = menus,
     })
+
+    -- Titan Classic (TBC) does not hide our custom tooltip when the mouse leaves the button.
+    button:HookScript("OnLeave", function(self)
+        if GameTooltip:GetOwner() == self then
+            GameTooltip:Hide()
+        end
+    end)
 end
 
 local function Initialize()
@@ -563,6 +675,55 @@ local function Initialize()
         if weaponDef.classes[classToken] then
             CreateWeaponPlugin(weaponDef)
         end
+    end
+end
+
+-- /tws debug: prints which skill API is in use and what each weapon lookup returns.
+local function PrintDebug()
+    local function out(msg)
+        DEFAULT_CHAT_FRAME:AddMessage("|cffeda55fTWS:|r " .. msg)
+    end
+
+    out("v" .. VERSION .. " locale=" .. locale .. " isTBC=" .. tostring(isTBC)
+        .. " build=" .. tostring(select(4, GetBuildInfo())))
+    out("mode=" .. (API_GetSkillLineInfoByID and "skillId lookup" or "skill list")
+        .. " | global GetNumSkillLines=" .. tostring(GetNumSkillLines ~= nil)
+        .. " | C_SkillInfo=" .. tostring(C_SkillInfo ~= nil)
+        .. " | ByID=" .. tostring(C_SkillInfo and C_SkillInfo.GetSkillLineInfoByID ~= nil))
+
+    cacheDirty = true
+    RefreshSkillCache()
+
+    for _, def in ipairs(WEAPON_DEFS) do
+        local line = def.id .. " (id " .. tostring(def.skillId) .. ")"
+        if API_GetSkillLineInfoByID and def.skillId then
+            local info = API_GetSkillLineInfoByID(def.skillId)
+            if type(info) == "table" then
+                local nameOk = def.nameLookup[info.name] and "ok" or "NAME MISMATCH"
+                line = line .. ": " .. tostring(info.name) .. " " .. tostring(info.rank) .. "/"
+                    .. tostring(info.maxRank) .. " [" .. nameOk .. "]"
+            else
+                line = line .. ": no data (not learned)"
+            end
+        else
+            local name, rank, maxRank = GetCachedSkill(def)
+            line = line .. ": " .. (name and (name .. " " .. rank .. "/" .. maxRank) or "not in list")
+        end
+        local known = IsWeaponProficiencyKnown(def)
+        out(line .. (known and " | proficiency known" or "") .. (def.classes[select(2, UnitClass("player"))] and "" or " | (other class)"))
+    end
+end
+
+SLASH_TITANWEAPONSKILLS1 = "/tws"
+SlashCmdList["TITANWEAPONSKILLS"] = function(msg)
+    msg = msg and msg:lower() or ""
+    if msg:match("^%s*debug") then
+        PrintDebug()
+    elseif msg:match("^%s*tooltip") then
+        tooltipDebug = not tooltipDebug
+        DEFAULT_CHAT_FRAME:AddMessage("|cffeda55fTWS:|r tooltip debug " .. (tooltipDebug and "ON" or "OFF"))
+    else
+        DEFAULT_CHAT_FRAME:AddMessage("|cffeda55fTWS:|r /tws debug | /tws tooltip")
     end
 end
 
